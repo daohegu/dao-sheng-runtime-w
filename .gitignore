@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.venv/
+# Installation Layer machine-local state (docs/deployment/INSTALLATION_CONTRACT.md §3).
+# Personal runtime data now lives OUTSIDE the worktree under the external data
+# home (%LOCALAPPDATA%\DaoSheng; override: DAO_SHENG_DATA_HOME). These entries
+# only prevent accidental `git add` -- they are NOT tracking protection: once a
+# path is tracked (e.g. an upstream commit starts tracking it), a plain
+# `git pull` overwrites it regardless of .gitignore. The tracking guard
+# (tools/repo_tracking_guard.py, CI: .github/workflows/repo-guard.yml) fails
+# the build if Git ever tracks anything under these prefixes.
+config/
+log/
+instances/
+
+# Claude Code local session config: exact path only (machine-local, not
+# part of the published runtime). Other .claude/ content is NOT excluded
+# by this rule.
+/.claude/settings.local.json
+
+# Local audit artifacts and protected review HTML are intentionally excluded.
+.scratch/
+/docs/dao-sheng-view.html
+/docs/architecture-review-20261008-000024.html
+/docs/architecture-review-20261008-145335.html

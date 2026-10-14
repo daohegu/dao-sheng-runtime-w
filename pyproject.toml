@@ -1,0 +1,10 @@
+# 工具链声明（L4 实现细节；M01 骨架）。
+# 语言 / 测试运行器选择属部署层实现细节，不构成 Domain 或架构决定
+# （无 ADR；如后续产生重大结构决定，按规则 8 先立 ADR）。
+
+[project]
+name = "dao-sheng-v1"
+version = "0.0.0"
+description = "DaoSheng Runtime：可由使用者自定义角色的 AI 个体运行时（记忆 / 经历连续性 / 反思 / 成长机制）"
+requires-python = ">=3.12"
+# 无外部依赖：V1 骨架仅使用标准库（含 unittest 测试）。

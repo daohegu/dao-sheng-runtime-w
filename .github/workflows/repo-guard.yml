@@ -1,0 +1,50 @@
+name: repo-tracking-guard
+
+# Upgrade-safety acceptance: personal runtime data (identity, faculties,
+# continuity, memory, capability records, install state, logs) must never
+# be tracked by Git -- a tracked path under instances/, config/, or log/
+# means a plain `git pull` can silently overwrite the user's personal
+# data. This gate runs on every push and pull request.
+#
+# Platform split (both jobs run on every push / pull_request):
+# - tracking-guard (Ubuntu): the platform-neutral guard run plus its
+#   self-verification tests (temp synthetic Git repos).
+# - data-home-tests (Windows): tests/test_data_home.py drives dao-sheng.ps1
+#   through powershell.exe, so it requires a Windows runner. It is NOT
+#   skipped anywhere -- a failing data-home test fails the build.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tracking-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Direct guard run: fails the build when Git tracks any personal-data path.
+      - name: Repo tracking guard
+        run: python tools/repo_tracking_guard.py
+
+      # Guard self-verification (temp synthetic Git repos). Platform-neutral.
+      - name: Tracking guard tests
+        run: python -m unittest tests.test_repo_tracking_guard -v
+
+  data-home-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Data-home / migration / role tests invoke dao-sheng.ps1 via
+      # powershell.exe -- Windows-only, runs on a Windows runner.
+      - name: Data-home tests (Windows)
+        run: python -m unittest tests.test_data_home -v
