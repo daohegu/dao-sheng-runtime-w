@@ -44,6 +44,108 @@ jobs:
         with:
           python-version: "3.12"
 
+      # TEMPORARY diagnostic for run 38585468143 (Microsoft.PowerShell.Security
+      # load failure). Prints environment + module metadata ONLY -- no env dump,
+      # no tokens, no file contents. Remove after one diagnostic run.
+      # continue-on-error: this step exits non-zero on launch failure, timeout,
+      # or non-zero child exit; the flag keeps such a diagnostic failure from
+      # failing the job or blocking the test step below.
+      - name: PS module diagnostic (temporary)
+        continue-on-error: true
+        run: |
+          Write-Output "=== [1] parent pwsh 7 PSModulePath ==="
+          Write-Output $env:PSModulePath
+          $diag = @'
+          import os, subprocess, sys, tempfile
+          POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+          print("=== [2] python os.environ (what the child inherits) ===")
+          print("PSModulePath:", os.environ.get("PSModulePath", "<not set>"))
+          print("TEMP:", os.environ.get("TEMP"))
+          print("TMP:", os.environ.get("TMP"))
+          print("tempfile.gettempdir():", tempfile.gettempdir())
+          ps = r"""
+          $ErrorActionPreference = 'Continue'
+          "=== [3] child powershell.exe view ==="
+          "PSVersion    : " + $PSVersionTable.PSVersion.ToString()
+          "PSModulePath : " + $env:PSModulePath
+          "--- [4a] candidate modules found in PSModulePath (discovery only) ---"
+          $cands = @(Get-Module -ListAvailable -Name Microsoft.PowerShell.Security)
+          if ($cands.Count -eq 0) {
+              "candidates: none found"
+          } else {
+              $cands | Select-Object Name, Version, ModuleType, ModuleBase |
+                  Format-List
+          }
+          "--- [4b] modules already loaded in this process (before explicit import) ---"
+          $loaded = @(Get-Module -Name Microsoft.PowerShell.Security)
+          if ($loaded.Count -eq 0) {
+              "loaded: none"
+          } else {
+              $loaded | Select-Object Name, Version, Path | Format-List
+          }
+          "--- [4c] explicit Import-Module attempt + actual loaded path ---"
+          try {
+              Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+              "Import-Module: OK"
+              "actual loaded path: " +
+                  (Get-Module Microsoft.PowerShell.Security).Path
+          } catch {
+              "Import-Module: FAILED"
+              "  FullyQualifiedErrorId : " + $_.FullyQualifiedErrorId
+              "  CategoryInfo          : " + ($_.CategoryInfo | Out-String).Trim()
+              "  Exception.Message     : " + $_.Exception.Message
+              if ($_.ErrorDetails.Message) {
+                  "  ErrorDetails          : " + $_.ErrorDetails.Message
+              }
+          }
+          "--- [5] Get-Command discovery (triggers autoload) ---"
+          foreach ($cmd in 'Get-Acl', 'Get-FileHash') {
+              try {
+                  $c = Get-Command $cmd -ErrorAction Stop
+                  "{0}: OK  Source={1}  Module={2}  Version={3}" -f `
+                      $cmd, $c.Source, $c.ModuleName, $c.Version
+              } catch {
+                  "{0}: NOT FOUND  ({1})" -f $cmd, $_.FullyQualifiedErrorId
+              }
+          }
+          """
+          def _text(value):
+              if value is None:
+                  return ""
+              if isinstance(value, bytes):
+                  return value.decode("utf-8", errors="replace")
+              return value
+          try:
+              proc = subprocess.run(
+                  [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                   "-Command", ps],
+                  capture_output=True, text=True, encoding="utf-8",
+                  errors="replace", timeout=120,
+              )
+          except FileNotFoundError as exc:
+              print("DIAG: powershell.exe launch failed:", exc)
+              sys.exit(2)
+          except subprocess.TimeoutExpired as exc:
+              print("DIAG: powershell.exe timed out after 120s; "
+                    "output below may be incomplete")
+              print("=== partial stdout ===")
+              print(_text(exc.stdout))
+              print("=== partial stderr ===")
+              print(_text(exc.stderr))
+              sys.exit(3)
+          print(proc.stdout)
+          if proc.stderr:
+              print("=== child stderr ===")
+              print(proc.stderr)
+          if proc.returncode != 0:
+              print("DIAG: child powershell.exe exited with returncode",
+                    proc.returncode, "- metadata above may be incomplete")
+              sys.exit(4)
+          sys.exit(0)
+          '@
+          Set-Content -Path "$env:RUNNER_TEMP\ps_diag.py" -Value $diag -Encoding utf8
+          python "$env:RUNNER_TEMP\ps_diag.py"
+
       # Data-home / migration / role tests invoke dao-sheng.ps1 via
       # powershell.exe -- Windows-only, runs on a Windows runner.
       - name: Data-home tests (Windows)
