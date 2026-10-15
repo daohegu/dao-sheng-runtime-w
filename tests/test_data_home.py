@@ -1039,7 +1039,12 @@ class ShortPathParityTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.tmp = Path(tmp.name)
+        # CI runner 的 TEMP 本身是短形（C:\\Users\\RUNNER~1\\...）：fixture
+        # 根先经 _normalize_path 展开为长形（大小写保留；fixture 目录真实
+        # 存在，其长形即 OS ground truth），使由 self.tmp 构造的期望值与
+        # 运行时输出（同样展开已存在前缀）处于同一表示。短形子用例仍由
+        # _short_path 从长形构造，真实展开语义不变。
+        self.tmp = run_dao_sheng._normalize_path(Path(tmp.name))
         long_dir = self.tmp / "ShortPathParityLongName"
         long_dir.mkdir()
         short = _short_path(long_dir)
@@ -1188,7 +1193,10 @@ class LongPathNameErrorTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.tmp = Path(tmp.name)
+        # 同 ShortPathParityTest：CI runner 的 TEMP 为短形，fixture 根展开
+        # 为长形后，期望值与 _expand_short_names 输出处于同一表示；短形
+        # 输入子用例（self.short_dir）仍验证真实展开。
+        self.tmp = run_dao_sheng._normalize_path(Path(tmp.name))
         self.long_dir = self.tmp / "LongPathNameErrorLongName"
         self.long_dir.mkdir()
         short = _short_path(self.long_dir)
@@ -1399,7 +1407,10 @@ class ShortPathDivergenceSafetyTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.tmp = Path(tmp.name)
+        # 同 ShortPathParityTest：CI runner 的 TEMP 为短形，fixture 根展开
+        # 为长形后期望值与运行时输出同表示；self.short_repo 仍由
+        # _short_path 构造，短形 → 长形的真实展开语义不变。
+        self.tmp = run_dao_sheng._normalize_path(Path(tmp.name))
         self.repo_copy = self.tmp / "RepoCopyDivergenceLongName"
         _copy_repo(self.repo_copy, with_venv=False)
         short = _short_path(self.repo_copy)
@@ -1487,7 +1498,14 @@ class PsProbeSeamTest(unittest.TestCase):
     DENY = "ReadData,ReadAttributes,ReadExtendedAttributes,ListDirectory"
 
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="dao-ps-probe-"))
+        # CI runner 的 TEMP 为短形（C:\\Users\\RUNNER~1\\...）：fixture 根
+        # 经 _normalize_path 展开为长形（大小写保留，不用 _canonical 的
+        # normcase 小写化——seam 断言是大小写敏感的 raw-text 比较）。
+        # 生产 helper 先对输入做 GetFullPath（CI 上展开已存在短形前缀），
+        # mock 的比较文本必须与 helper 实际收到的规范化形状一致，否则
+        # seam 注入失配。长形输入经 GetFullPath 逐字保留 → 断言形状确定。
+        self.tmp = run_dao_sheng._normalize_path(
+            Path(tempfile.mkdtemp(prefix="dao-ps-probe-")))
         # LIFO：先注册 → 后执行（ACL 移除先于临时目录删除）
         self.addCleanup(shutil.rmtree, str(self.tmp), ignore_errors=True)
 
@@ -1518,6 +1536,44 @@ class PsProbeSeamTest(unittest.TestCase):
             raise RuntimeError(
                 f"ACL {action} failed on {directory}:\n{proc.stdout}\n{proc.stderr}"
             )
+
+    # ---- 真实 ACL 测试的前置自验证 ----
+
+    def _deny_effective_for_current_identity(self, path: Path) -> bool:
+        """前置自验证：直接执行生产探针的底层调用
+        ([System.IO.File]::GetAttributes)，确认 Deny ACE 对「将要运行探针的
+        同一身份」确实被 OS 强制执行。严格三分类：
+
+        - 明确抛出 UnauthorizedAccessException → True（继续原有 ACL 断言）；
+        - GetAttributes 正常返回 → False（允许明确 skip）；
+        - 其他异常或无法解析的输出 → 直接失败本测试，不允许 skip
+          （意外错误不得被误归类为「Deny ACE 未生效」而跳过断言）。
+
+        真实 ACL fault-injection 的可重复性依赖这个前提，而前提本身是
+        身份相关的：CI run 377cd2e 观察到 Deny ACE 应用成功（exit 0）、
+        trustee 即探针进程当前身份（GetCurrent().Name），但同进程
+        GetAttributes 仍成功读取属性；精确的 OS 原因尚未确定，因此测试
+        直接检查前置条件，而不预设原因。前提不成立时显式 skip，而不是
+        让 fail-loud 断言建立在不可靠的注入上。fail-loud 分类逻辑本身由
+        seam 注入测试（确定性、全平台）与 test_real_probe_unavailable_unc_share_fails_loud
+        （本机 OS 真实 IOException）覆盖。"""
+        proc = _run_ps_lib(
+            "try { [System.IO.File]::GetAttributes('" + str(path) + "') | Out-Null; "
+            "Write-Host 'DENY-EFFECTIVE=False' } "
+            "catch [System.UnauthorizedAccessException] { Write-Host 'DENY-EFFECTIVE=True' } "
+            "catch { Write-Host ('DENY-EFFECTIVE=OTHER:' + $_.Exception.GetType().Name) }"
+        )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        if "DENY-EFFECTIVE=True" in out:
+            return True
+        if "DENY-EFFECTIVE=False" in out:
+            return False
+        self.fail(
+            "deny-effectiveness probe produced no parseable result "
+            "(unexpected error or malformed output); this is NOT treated as a "
+            f"skip condition:\n{out}"
+        )
 
     # ---- seam 注入（模拟错误形状，调用生产 Get-CanonicalPathForComparison）----
 
@@ -1677,12 +1733,25 @@ class PsProbeSeamTest(unittest.TestCase):
         （ListDirectory/ReadAttributes，ContainerInherit）→ 生产探针对
         DeniedDir\\ChildDir\\Leaf 真实命中访问拒绝 → 抛
         InvalidOperationException（消息明确「未被当成不存在」），
-        walk-up 不得越过被拒组件。"""
+        walk-up 不得越过被拒组件。
+
+        前置自验证（见 _deny_effective_for_current_identity）：当前进程的
+        实际探测未产生预期的访问拒绝时显式 skip——注入不可靠不等于探针
+        契约失败（精确的 OS 原因尚未确定）；分类逻辑的 fail-loud 验证由
+        seam 注入测试与真实 UNC 测试保留。"""
         denied = self.tmp / "DeniedDir"
         child = denied / "ChildDir"
         child.mkdir(parents=True)
         self._acl(denied, "deny")
         self.addCleanup(self._acl, denied, "remove")
+        if not self._deny_effective_for_current_identity(child):
+            self.skipTest(
+                "Deny ACE applied but the current process's actual probe did "
+                "not produce the expected access denial (GetAttributes "
+                "succeeded); the OS-level reason is not established - real-ACL "
+                "fault injection is identity-dependent; see "
+                "_deny_effective_for_current_identity"
+            )
         proc = _run_ps_lib(
             "try { $r = Get-CanonicalPathForComparison '" + str(child) + "\\Leaf'; "
             "Write-Host ('RETURNED=' + $r) } "
@@ -1700,12 +1769,23 @@ class PsProbeSeamTest(unittest.TestCase):
         """真实 ACL 集成测试（端到端）：数据根真实存在但位于被 Deny ACE
         拒绝读取的目录下 → 中央守卫分类探针真实命中访问拒绝 → exit 1 +
         [FAIL] data home + existence probe failed；既不被当成「缺失」也不
-        被当成「仓库内 / 仓库外」判定成功，任何写入都未发生。"""
+        被当成「仓库内 / 仓库外」判定成功，任何写入都未发生。
+
+        前置自验证同 test_real_acl_denied_intermediate_fails_loud：当前
+        进程的实际探测未产生预期的访问拒绝时显式 skip。"""
         denied = self.tmp / "DeniedHome"
         data_home = denied / "DataHome"
         data_home.mkdir(parents=True)
         self._acl(denied, "deny")
         self.addCleanup(self._acl, denied, "remove")
+        if not self._deny_effective_for_current_identity(data_home):
+            self.skipTest(
+                "Deny ACE applied but the current process's actual probe did "
+                "not produce the expected access denial (GetAttributes "
+                "succeeded); the OS-level reason is not established - real-ACL "
+                "fault injection is identity-dependent; see "
+                "_deny_effective_for_current_identity"
+            )
         proc = _run_ps(
             ["status"], env=_env(**{DATA_HOME_ENV: str(data_home)}),
         )
