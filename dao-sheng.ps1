@@ -104,7 +104,18 @@ function Resolve-DataHome {
     # override (trimmed; '~' expanded via USERPROFILE; relative resolved
     # against the current directory), else %LOCALAPPDATA%\DaoSheng with a
     # %USERPROFILE%\AppData\Local\DaoSheng fallback. GetFullPath matches
-    # Python os.path.abspath normalization (no symlink resolution).
+    # Python normalization (no symlink resolution) AND expands 8.3 short
+    # names of existing components to long names; run_dao_sheng.py
+    # _expand_short_names() mirrors this via GetLongPathNameW (runner
+    # TEMP is C:\Users\RUNNER~1\... while PowerShell reports
+    # C:\Users\runneradmin\...). MEASURED CAVEAT (PS 5.1): for the shape
+    # "existing 8.3 short component + missing leaf" GetFullPath's output
+    # text is call-order dependent within one process (calling the child
+    # path first -> long form; a parent GetFullPath call first -> short
+    # form), so raw text parity is only guaranteed for fully existing
+    # paths. The inside-repo decision is kept safe-identical across both
+    # runtimes for every shape by Test-PathInsideRepo's walk-up
+    # canonicalization (Get-CanonicalPathForComparison, see below).
     $raw = $env:DAO_SHENG_DATA_HOME
     if (-not [string]::IsNullOrWhiteSpace($raw)) {
         $value = $raw.Trim()
@@ -131,12 +142,114 @@ function Resolve-DataHome {
     return [System.IO.Path]::GetFullPath((Join-Path $base "DaoSheng"))
 }
 
+function Test-PathExistsForComparison {
+    param([string]$Path)
+    # Tri-state existence probe for the walk-up canonicalization below.
+    #   $true  -> the path exists;
+    #   $false -> DEFINITIVELY missing (Win32 ERROR_FILE_NOT_FOUND /
+    #             ERROR_PATH_NOT_FOUND, surfaced by .NET as
+    #             FileNotFoundException / DirectoryNotFoundException);
+    #   throw  -> every other failure: access denied
+    #             (UnauthorizedAccessException), unexpected IO error,
+    #             unavailable drive or unreachable UNC share root
+    #             (IOException, e.g. ERROR_BAD_NETPATH). Such a failure
+    #             is NOT "missing" and must never be walked up past.
+    # MEASURED on PS 5.1 / Windows 11 26100 (2026-10-15): missing leaf ->
+    # FileNotFoundException; missing intermediate -> DirectoryNotFound-
+    # Exception; nonexistent drive letter (Z:\ and Z:\Missing) ->
+    # DirectoryNotFoundException (definitively missing -- but the walk-up
+    # must NOT keep such an input verbatim: reaching an unverified ROOT is
+    # fail-loud, see Get-CanonicalPathForComparison); unreachable host UNC
+    # (full path AND the share root itself) and a missing share on a
+    # reachable host (\\127.0.0.1\share...) -> IOException "network path
+    # was not found"; bare server name (\\server) -> ArgumentException;
+    # traversal-blocked path -> UnauthorizedAccessException.
+    # Test-Path returns $false for ALL of these -- exactly the conflation
+    # this probe replaces.
+    # Injectable seam (tests only): a session/script-scoped
+    # $DaoShengPathExistsProbe scriptblock replaces the real probe so
+    # tests can drive the PRODUCTION walk-up helper with each failure
+    # classification without machine-specific ACL setups. Production
+    # never sets this variable.
+    if ($DaoShengPathExistsProbe) { return & $DaoShengPathExistsProbe $Path }
+    try {
+        [void][System.IO.File]::GetAttributes($Path)
+        return $true
+    } catch [System.IO.FileNotFoundException] { return $false }
+    catch [System.IO.DirectoryNotFoundException] { return $false }
+    catch {
+        $inner = $_.Exception
+        while ($inner.InnerException) { $inner = $inner.InnerException }
+        throw [System.InvalidOperationException]::new(
+            ("existence probe failed for '" + $Path + "' (" + $inner.GetType().Name + ": " + $inner.Message + "); " +
+             "access denied / IO error / unavailable drive or UNC root is not 'missing' and was not treated as such"),
+            $_.Exception)
+    }
+}
+
+function Get-CanonicalPathForComparison {
+    param([string]$Path)
+    # Canonical text for containment comparison: walk up to the longest
+    # existing prefix, expand it via GetFullPath (8.3 components -> long
+    # names), then re-append the missing tail verbatim. Mirrors
+    # run_dao_sheng.py _expand_short_names(). Plain GetFullPath alone is
+    # NOT reliable for containment: measured on PS 5.1, its output for
+    # "existing short component + missing leaf" depends on prior calls in
+    # the same process (child-first -> long form; parent-first -> short
+    # form), so a short-form component could slip through a raw-text
+    # comparison. Canonicalizing BOTH sides through this walk-up expands
+    # every EXISTING component regardless of call order, keeping the
+    # inside-repo decision identical to the Python side.
+    # The walk-up steps ONLY over components Test-PathExistsForComparison
+    # reports as DEFINITIVELY missing. An access-denied, IO-error or
+    # unexpected failure throws out of the probe and aborts
+    # canonicalization fail-loud: such a path is never treated as "does
+    # not exist" and never walked up past. If the walk-up reaches a ROOT
+    # (no parent) and the root itself is reported missing, the root is
+    # unavailable -- a nonexistent drive root or a missing / unreachable
+    # UNC share root -- which is NOT a normal missing component: fail loud
+    # instead of returning the input verbatim (mirrors run_dao_sheng.py
+    # _expand_short_names()). Normal new-directory paths on an EXISTING
+    # drive terminate at a verified-existing component (at worst the drive
+    # root itself) and are unaffected.
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $tail = [System.Collections.Generic.List[string]]::new()
+    $current = $full
+    while (-not (Test-PathExistsForComparison $current)) {
+        $parent = [System.IO.Path]::GetDirectoryName($current)
+        if (-not $parent -or $parent -eq $current) {
+            throw [System.InvalidOperationException]::new(
+                ("root of '" + $full + "' ('" + $current + "') could not be " +
+                 "verified as existing; unavailable drive root or missing / " +
+                 "unreachable UNC share root is not a normal missing " +
+                 "component and was not canonicalized verbatim"))
+        }
+        $tail.Add([System.IO.Path]::GetFileName($current))
+        $current = $parent
+    }
+    $canonical = [System.IO.Path]::GetFullPath($current)
+    for ($i = $tail.Count - 1; $i -ge 0; $i--) {
+        $canonical = [System.IO.Path]::Combine($canonical, $tail[$i])
+    }
+    return $canonical
+}
+
 function Test-PathInsideRepo([string]$Path) {
     # True when $Path resolves to the repository worktree itself or a path
     # inside it (full normalization; case-insensitive comparison as on
-    # Windows; mirrors run_dao_sheng.py _is_inside_repo()).
-    $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
-    $repo = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\')
+    # Windows; mirrors run_dao_sheng.py _is_inside_repo()). BOTH sides go
+    # through Get-CanonicalPathForComparison, so every EXISTING 8.3 short
+    # component is expanded to its long name regardless of GetFullPath's
+    # measured call-order dependence, and a short-form worktree vs a
+    # long-form inside-repo path (or vice versa) is still detected.
+    # TrimEnd + DirectorySeparatorChar builds a single-separator boundary:
+    # when the repo root is a drive root the canonical text already ends
+    # with one separator, and appending another would make direct children
+    # of a drive-root repo miss the prefix (mirrors Python
+    # root.rstrip(os.sep) + os.sep). Different drive letters can never be
+    # prefixes of each other, so cross-drive paths are never misjudged.
+    $full = (Get-CanonicalPathForComparison $Path).TrimEnd('\')
+    $repo = (Get-CanonicalPathForComparison $RepoRoot).TrimEnd('\')
     if ($full -eq $repo) { return $true }
     return $full.StartsWith($repo + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
 }
@@ -1007,8 +1120,23 @@ function Invoke-MigrateData {
         }
         if ($null -ne $stateDoc -and $stateDoc.PSObject.Properties.Name -contains "instance_root") {
             $recorded = [string]$stateDoc.instance_root
-            if ($recorded -ne "" -and (Test-PathInsideRepo $recorded)) {
-                $recFull = [System.IO.Path]::GetFullPath($recorded).TrimEnd('\')
+            $recFull = $null
+            if ($recorded -ne "") {
+                # Probe failure (access denied / IO error / unavailable
+                # drive / unreachable UNC root) aborts fail-loud BEFORE
+                # anything is rewritten: install-state.json stays intact.
+                try {
+                    if (Test-PathInsideRepo $recorded) {
+                        $recFull = (Get-CanonicalPathForComparison $recorded).TrimEnd('\')
+                    }
+                } catch {
+                    Fail-Step "migrate-data install-state fix-up" "install-state instance_root to be classifiable" ("existence probe failed: " + $_.Exception.Message) "install-state.json was left untouched; resolve the path/access error and re-run"
+                }
+            }
+            if ($null -ne $recFull) {
+                # Same canonical text the containment decision used, so the
+                # Substring below extracts the right relative position even
+                # when $recorded mixes short/long forms or has a missing leaf.
                 $relRoot = $recFull.Substring($repoFull.Length).TrimStart('\')
                 $newRoot = [System.IO.Path]::GetFullPath((Join-Path $script:DataHome $relRoot))
                 $stateDoc.instance_root = $newRoot
@@ -1022,6 +1150,15 @@ function Invoke-MigrateData {
     Write-Host "migrate-data complete: $migrated file(s) moved to the data home (sources removed; empty legacy directories left in place)"
     exit 0
 }
+
+# Test seam (DAO_SHENG_PS_LIB_ONLY=1): define the functions and stop
+# BEFORE the usage check, the central guard and the command dispatch, so
+# tests can dot-source this file, override $DaoShengPathExistsProbe, and
+# call the production helpers (Test-PathExistsForComparison /
+# Get-CanonicalPathForComparison / Test-PathInsideRepo) directly.
+# Production entries never set this variable; only the exact value "1"
+# is honored, and this mode reads/writes nothing.
+if ($env:DAO_SHENG_PS_LIB_ONLY -eq "1") { return }
 
 if ([string]::IsNullOrWhiteSpace($Command)) {
     Write-Usage
@@ -1041,11 +1178,20 @@ if ($Command -ne "init-role" -and $Command -ne "configure-role" -and @($RoleArgs
 # upgrade (git pull) structurally unable to touch personal data.
 # ---------------------------------------------------------------------------
 $script:DataHome = Resolve-DataHome
-if (Test-PathInsideRepo $script:DataHome) {
+# A probe failure (access denied / IO error / unavailable drive /
+# unreachable UNC root) is NOT "outside the repo" and NOT "missing": it
+# aborts the guard fail-loud via Fail-Step, same exit path as a refusal.
+try { $dataHomeInsideRepo = Test-PathInsideRepo $script:DataHome } catch {
+    Fail-Step "data home" "a personal-data root OUTSIDE the repository worktree ($RepoRoot)" ("existence probe failed: " + $_.Exception.Message) "Resolve the path/access error first (access denied / IO error / unavailable drive / unreachable UNC root is NOT treated as 'missing'); nothing was written"
+}
+if ($dataHomeInsideRepo) {
     Fail-Step "data home" "a personal-data root OUTSIDE the repository worktree ($RepoRoot)" $script:DataHome "Point DAO_SHENG_DATA_HOME to a directory outside the repository (or unset it for the default) and re-run; nothing was written"
 }
 $script:ResolvedInstanceRoot = Resolve-InstanceRoot $InstanceRoot
-if (Test-PathInsideRepo $script:ResolvedInstanceRoot) {
+try { $instanceRootInsideRepo = Test-PathInsideRepo $script:ResolvedInstanceRoot } catch {
+    Fail-Step "instance root" "an instance root OUTSIDE the repository worktree ($RepoRoot)" ("existence probe failed: " + $_.Exception.Message) "Resolve the path/access error first (access denied / IO error / unavailable drive / unreachable UNC root is NOT treated as 'missing'); nothing was written"
+}
+if ($instanceRootInsideRepo) {
     Fail-Step "instance root" "an instance root OUTSIDE the repository worktree ($RepoRoot)" $script:ResolvedInstanceRoot "-InstanceRoot must resolve outside the repository (relative paths resolve against the data home); nothing was written"
 }
 $script:StateFile = Join-Path $script:DataHome "config\install-state.json"

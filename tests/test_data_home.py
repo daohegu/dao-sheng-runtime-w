@@ -19,14 +19,53 @@
   未迁移源完好留原位、已迁移文件留数据根、无 partial 残留、install 与
   Python 入口均拒绝静默空白启动、故障移除后重跑安全续迁且哈希逐项一致
   （MigrateDataMidFailureTest）。
+  Windows 8.3 短路径回归（ShortPathParityTest）：同一实际位置的短名 /
+  长名文本表示两侧解析一致（PS GetFullPath 展开已存在组件的短名；
+  Python _expand_short_names 经 GetLongPathNameW 对齐），仓库内拒绝跨
+  表示一致生效，junction 不被解析。
+  GetLongPathNameW 错误码分类回归（LongPathNameErrorTest）：仅本机实测
+  确认的「组件不存在」码 2 / 3 允许向上回退；权限拒绝（5，经 fake API
+  注入错误码模拟）与语法非法 123 及意外码一律 fail-loud OSError；回退
+  到达根（盘符根 / UNC 共享根）仍无法验证根存在（不存在盘符的盘符根实测
+  3）时 fail-loud，不把根不可用当成正常缺失。盘符根边界（DriveRootBoundaryTest）：盘符根仓库
+  的仓库内判定正确（直接子路径不漏判），不同盘符路径互不误判。
+  短名组件 + 不存在叶子分歧安全回归（ShortPathDivergenceSafetyTest）：
+  PS 5.1 GetFullPath 对该形状的输出受同进程调用顺序影响，文本 parity
+  不宣称；保证的是两侧「仓库内」判定一致——仓库内被拒（PS exit 1 +
+  [FAIL] data home；Python RuntimeError），仓库外被正常接受且不存在
+  叶子逐字保留（dao-sheng.ps1 经 Get-CanonicalPathForComparison 做与
+  Python 相同的 walk-up 规范化）。
+  PS 存在性探针 seam 回归（PsProbeSeamTest）：dao-sheng.ps1 的 walk-up 只
+  回退 Test-PathExistsForComparison 判定为「确定不存在」（FNFE/DNFE）的
+  组件；访问拒绝 / 意外 IO 错误 / 不可用驱动器或不可达 UNC 根 fail-loud，
+  绝不当成不存在。测试经 DAO_SHENG_PS_LIB_ONLY=1 加载并直接调用生产
+  helper，分两类证据：seam 注入（$DaoShengPathExistsProbe 模拟错误形状——
+  缺失回退逐字保留 / 中途访问拒绝停止 / 叶子 IO 错误停止 / 驱动器根错误
+  停止 / 根始终缺失停止）是模拟错误注入测试，不是真实 ACL 集成测试；真实
+  Set-Acl Deny ACE（生产探针真实命中被拒路径，helper 级与中央守卫端到端
+  各一条）是真实 ACL 集成测试。跨运行时统一根判定（本轮修复）：两侧
+  walk-up 只越过「确定不存在」的组件，回退到达根而根仍报告缺失时一律
+  fail-loud，不再原样返回——Python 侧不存在盘符（根实测 3）此前保持原
+  样，现抛 OSError；PS 侧此前对不存在盘符逐字保留，现抛
+  InvalidOperationException。不可用 UNC 根实测：Python 不可达主机 53、可
+  达主机缺失共享 67、裸服务器名 161（均不属 2 / 3，本就 fail-loud）；PS
+  对应形状 IOException / ArgumentException（本就 fail-loud）。本机没有可
+  用的真实不可达 UNC 服务器：UNC 分类经 seam 注入验证，另以本机回环
+  （127.0.0.1 上必然不存在的共享名）做 OS 级真实分类测试——两者都不是
+  真实网络 / 远程 UNC 服务器集成测试。
 
 测试纪律：绝不触碰真实实例 / 真实 Hermes 数据 / 真实用户数据根的写入；
 ① 的 PS 侧为只读 status（不写任何文件）。需要 install 的测试在仓库临时
-副本 + 副本内独立 venv 上进行。Git 模拟全部在临时目录。
+副本 + 副本内独立 venv 上进行。Git 模拟全部在临时目录。直接启动
+powershell.exe（5.1）的子进程统一经 _ps_safe_env / _strip_psmodulepath
+去除复制环境中的 PSModulePath（Windows workflow 默认 PS7，Python 继承
+其 PSModulePath 会使 5.1 错误发现 PS7 模块并加载失败；不修改
+os.environ / 调用者 env / 机器与用户级变量）。
 """
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import importlib.util
 import json
@@ -37,6 +76,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from ctypes import wintypes
 from functools import partial
 from pathlib import Path
 
@@ -83,14 +123,56 @@ def _env(**overrides) -> dict[str, str]:
     return env
 
 
+def _strip_psmodulepath(env: dict[str, str]) -> dict[str, str]:
+    """返回移除 PSModulePath（按变量名不区分大小写）后的 env 副本。
+
+    Windows workflow 默认 shell 是 PowerShell 7；Python 子进程继承 PS7 的
+    PSModulePath，随后其启动 Windows PowerShell 5.1 时错误发现 PS7 的
+    Microsoft.PowerShell.Security 7.0.0.0 模块——因重复 ObjectSecurity
+    类型成员加载失败，Get-Acl / Get-FileHash 不可用。从子进程环境副本中
+    移除该变量使 5.1 回退到自身默认模块搜索路径。不修改 os.environ、不
+    修改调用者的原始 env、不触碰机器级 / 用户级环境变量。"""
+    child = dict(env)
+    for key in [k for k in child if k.lower() == "psmodulepath"]:
+        del child[key]
+    return child
+
+
+def _ps_safe_env(**overrides) -> dict[str, str]:
+    """直接启动 powershell.exe（5.1）时使用的子进程环境。"""
+    return _strip_psmodulepath(_env(**overrides))
+
+
 def _run_ps(args, cwd=None, env=None, stdin_text="", entry=ENTRY):
     """真实调用 dao-sheng.ps1 子进程。stdout 中 CJK 可能因控制台代码页
-    失真——断言只依赖 ASCII 标记（[OK]/[FAIL]）、ASCII 标签行与载体文件。"""
+    失真——断言只依赖 ASCII 标记（[OK]/[FAIL]）、ASCII 标签行与载体文件。
+    子进程环境统一经 _strip_psmodulepath（PS 5.1 模块发现污染，见其
+    docstring）。"""
+    child_env = _strip_psmodulepath(env) if env is not None else _ps_safe_env()
     return subprocess.run(
         [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
          "-File", str(entry), *args],
         cwd=str(cwd) if cwd is not None else None,
-        env=env, input=stdin_text,
+        env=child_env, input=stdin_text,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=300,
+    )
+
+
+def _run_ps_lib(body: str):
+    """lib 模式 dot-source dao-sheng.ps1 后在同一作用域执行 body。
+
+    DAO_SHENG_PS_LIB_ONLY=1 使 dao-sheng.ps1 只定义函数，在 usage 检查、
+    中央守卫与命令 dispatch 之前 return——不读不写任何文件，测试因此可以
+    覆盖 $DaoShengPathExistsProbe 并直接调用生产 helper（这满足「测试必须
+    调用生产 helper，不得只测试独立复制的分类逻辑」）。入口路径经 -Command
+    命令行（UTF-16）传入，dao-sheng.ps1 文件内容保持 ASCII（PS 5.1 按
+    ANSI 读取无 BOM .ps1）。子进程环境经 _ps_safe_env。"""
+    script = "$ErrorActionPreference = 'Stop'; " + f". '{ENTRY}'; " + body
+    return subprocess.run(
+        [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-Command", script],
+        env=_ps_safe_env(**{"DAO_SHENG_PS_LIB_ONLY": "1"}),
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=300,
     )
@@ -104,6 +186,41 @@ def _parse_data_home(stdout: str) -> str:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _canonical(path) -> str:
+    """由 env / TEMP 构造的期望值的规范文本：Python _normalize_path
+    （Windows 8.3 短名展开为长名，与 PS GetFullPath 的规范形一致）+
+    normcase。runner 上 TEMP 本身可能是短形（C:\\Users\\RUNNER~1\\...），
+    据此拼接的期望值必须先规范化才能与两侧运行时输出比较。跨运行时
+    parity 断言仍比较两侧原始输出文本（normcase），不用本函数——
+    那不是放宽：仍要求 PS 与 Python 都独立展开到同一规范形。"""
+    return os.path.normcase(str(run_dao_sheng._normalize_path(Path(str(path)))))
+
+
+def _short_path(path) -> str | None:
+    """GetShortPathNameW：已存在路径的 8.3 短形文本（长名本身 8.3-valid
+    时原样返回，大小写保留）；API 失败返回 None——含卷禁用 8.3 名称生成
+    （该卷上没有短名）。测试专用 helper，用于在长形 TEMP 的本机上构造
+    短形路径，覆盖 runner 的 RUNNER~1 场景。argtypes / restype 显式声明
+    （同 run_dao_sheng._get_long_path_name 的理由：ctypes 默认 c_int 会
+    误读返回的长度）。"""
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetShortPathNameW.argtypes = [
+        wintypes.LPCWSTR,  # lpszPath
+        wintypes.LPWSTR,   # lpBuffer（create_unicode_buffer 实例）
+        wintypes.DWORD,    # cchBuffer
+    ]
+    kernel32.GetShortPathNameW.restype = wintypes.DWORD
+    size = max(260, len(str(path)) + 1)
+    while True:
+        buffer = ctypes.create_unicode_buffer(size)
+        written = kernel32.GetShortPathNameW(str(path), buffer, size)
+        if 0 < written < size:
+            return buffer.value
+        if written == 0:
+            return None  # 路径不存在 / 非法 / 卷禁用 8.3 生成
+        size = written + 1  # 缓冲区不足：MSDN 返回所需长度（含 NUL）
 
 
 def _copy_repo(dest: Path, *, with_venv: bool) -> None:
@@ -129,6 +246,70 @@ class _StubReflectionModel:
         return "stub reflection output for data-home test"
 
 
+class PsSafeEnvTest(unittest.TestCase):
+    """环境辅助函数本身的测试：PSModulePath 移除按变量名大小写不敏感、
+    经副本进行、不修改 os.environ / 调用者 env / 机器与用户级变量；并
+    证明去除在真实 powershell.exe 子进程中确实生效。"""
+
+    def test_strip_case_insensitive_and_copy_semantics(self) -> None:
+        env = {
+            "PSModulePath": r"C:\ps7-modules",
+            "psmodulepath": r"C:\dup-lower",
+            "PSMODULEPATH": r"C:\dup-upper",
+            "PSModulePathExtra": "keep-me",
+            "DAO_UNRELATED": "keep-me",
+        }
+        child = _strip_psmodulepath(env)
+        self.assertFalse([k for k in child if k.lower() == "psmodulepath"])
+        # 仅移除 PSModulePath 本身：PSModulePathExtra 等无关键保留
+        self.assertEqual(child["PSModulePathExtra"], "keep-me")
+        self.assertEqual(child["DAO_UNRELATED"], "keep-me")
+        # 调用者的原始 env 字典不被修改
+        self.assertEqual(env, {
+            "PSModulePath": r"C:\ps7-modules",
+            "psmodulepath": r"C:\dup-lower",
+            "PSMODULEPATH": r"C:\dup-upper",
+            "PSModulePathExtra": "keep-me",
+            "DAO_UNRELATED": "keep-me",
+        })
+
+    def test_helpers_do_not_touch_os_environ(self) -> None:
+        before = dict(os.environ)
+        _ps_safe_env(**{"DAO_TEST_OVERRIDE": "1"})
+        _strip_psmodulepath(dict(os.environ))
+        _env(**{"DAO_TEST_OVERRIDE": "1", "DAO_TEST_DELETE": None})
+        self.assertEqual(dict(os.environ), before)
+
+    def test_ps_safe_env_strips_injected_psmodulepath(self) -> None:
+        env = _ps_safe_env(
+            **{"PSModulePath": "C:\\bogus-marker", "DAO_TEST": "1"},
+        )
+        self.assertFalse([k for k in env if k.lower() == "psmodulepath"])
+        self.assertEqual(env["DAO_TEST"], "1")
+
+    def test_child_powershell_actually_loses_injected_psmodulepath(self) -> None:
+        """端到端：对照组证明注入的 PSModulePath 确实被子进程继承；
+        经 _ps_safe_env 去除后子进程不再看到 marker——证明去除真实生效。"""
+        marker = "bogus-psmodulepath-marker"
+        polluted = _env(**{"PSModulePath": marker})
+        safe = _ps_safe_env(**{"PSModulePath": marker})
+        self.assertFalse([k for k in safe if k.lower() == "psmodulepath"])
+
+        def _probe(env):
+            return subprocess.run(
+                [POWERSHELL, "-NoProfile", "-Command", "$env:PSModulePath"],
+                env=env, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=120,
+            )
+
+        control = _probe(polluted)
+        self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
+        self.assertIn(marker, control.stdout.lower())
+        stripped = _probe(safe)
+        self.assertEqual(stripped.returncode, 0, stripped.stdout + stripped.stderr)
+        self.assertNotIn(marker, stripped.stdout.lower())
+
+
 class DefaultDataHomeParityTest(unittest.TestCase):
     """①：默认数据根——PS 与 Python 解析一致（PS 侧只读 status）。"""
 
@@ -150,7 +331,7 @@ class DefaultDataHomeParityTest(unittest.TestCase):
         if localappdata:
             self.assertEqual(
                 os.path.normcase(str(py_home)),
-                os.path.normcase(os.path.join(localappdata, "DaoSheng")),
+                _canonical(os.path.join(localappdata, "DaoSheng")),
             )
 
 
@@ -170,7 +351,7 @@ class OverrideParityTest(unittest.TestCase):
         ps_home = _parse_data_home(proc.stdout)
         py_home = run_dao_sheng.resolve_data_home(env=env)
         self.assertEqual(os.path.normcase(ps_home), os.path.normcase(str(py_home)))
-        self.assertEqual(os.path.normcase(str(py_home)), os.path.normcase(str(home)))
+        self.assertEqual(os.path.normcase(str(py_home)), _canonical(str(home)))
 
     def test_relative_override_parity_cross_process(self) -> None:
         """相对覆盖值：PS 按当前工作目录解析；Python 经独立子进程
@@ -197,7 +378,7 @@ class OverrideParityTest(unittest.TestCase):
         self.assertEqual(os.path.normcase(ps_home), os.path.normcase(py_home))
         self.assertEqual(
             os.path.normcase(py_home),
-            os.path.normcase(str(self.tmp / "dh-rel")),
+            _canonical(str(self.tmp / "dh-rel")),
         )
 
 
@@ -366,7 +547,7 @@ class MigrateDataSafetyTest(unittest.TestCase):
         )
         self.assertEqual(
             os.path.normcase(state["instance_root"]),
-            os.path.normcase(str(self.data_home / "instances" / "default")),
+            _canonical(str(self.data_home / "instances" / "default")),
         )
         self.assertEqual(state["python"], "3.12")
         self.assertIn("instance_root updated", proc.stdout)
@@ -511,6 +692,7 @@ class MigrateDataMidFailureTest(unittest.TestCase):
         )
         proc = subprocess.run(
             [POWERSHELL, "-NoProfile", "-Command", script],
+            env=_ps_safe_env(),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=120,
         )
@@ -597,7 +779,7 @@ class MigrateDataMidFailureTest(unittest.TestCase):
         )
         self.assertEqual(
             os.path.normcase(state["instance_root"]),
-            os.path.normcase(str(self.data_home / "instances" / "default")),
+            _canonical(str(self.data_home / "instances" / "default")),
         )
         self.assertEqual(state["python"], "3.12")
         self.assertEqual(state["installed_by"], "mid-failure-test")
@@ -681,7 +863,7 @@ class ExternalDataHomeEndToEndTest(unittest.TestCase):
         doc = json.loads(state.read_text(encoding="utf-8"))
         self.assertEqual(
             os.path.normcase(doc["instance_root"]),
-            os.path.normcase(str(self.data_home / "instances" / "default")),
+            _canonical(str(self.data_home / "instances" / "default")),
         )
 
     def test_all_personal_data_carriers_written_outside_worktree(self) -> None:
@@ -840,6 +1022,702 @@ class GitPullSimulationTest(unittest.TestCase):
 
         # 守卫必须对工作仓库的跟踪状态返回失败
         self.assertEqual(guard.main(["--repo", str(work)]), 1)
+
+
+@unittest.skipIf(os.name != "nt", "Windows 8.3 短名 / GetFullPath 行为专用")
+class ShortPathParityTest(unittest.TestCase):
+    """Windows 8.3 短路径回归：同一实际位置的短名 / 长名文本表示，PS
+    GetFullPath 与 Python _expand_short_names（GetLongPathNameW）解析一
+    致；仓库内拒绝跨表示一致生效；junction 不被解析。
+
+    GitHub Windows runner 的 TEMP 本身就是短形（C:\\Users\\RUNNER~1\\...），
+    该场景在 runner 上由 DefaultDataHomeParityTest / OverrideParityTest 的
+    _canonical 期望值覆盖。本机 TEMP 为长形时无法天然复现 RUNNER~1，故本
+    类用 GetShortPathNameW（_short_path）从实际存在的长路径构造短形，
+    在两侧运行时上验证同一展开行为。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        long_dir = self.tmp / "ShortPathParityLongName"
+        long_dir.mkdir()
+        short = _short_path(long_dir)
+        if short is None or "~" not in Path(short).name:
+            self.skipTest(
+                "8.3 short-name generation is disabled on this volume "
+                "(or the API failed) -- short/long parity cannot be "
+                "exercised here; the GitHub Windows runner has it enabled"
+            )
+        self.long_dir = long_dir
+        self.short_dir = short
+        self.expected = _canonical(str(long_dir))
+
+    def test_short_form_override_expanded_by_both_runtimes(self) -> None:
+        """短形覆盖值：PS GetFullPath 与 Python GetLongPathNameW 各自独立
+        展开到同一长形（修复前 Python 保持短形、PS 展开——必失败的真实
+        回归）。"""
+        env = _env(**{DATA_HOME_ENV: self.short_dir})
+        proc = _run_ps(["status"], env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        ps_home = _parse_data_home(proc.stdout)
+        py_home = run_dao_sheng.resolve_data_home(env=env)
+        # 跨运行时 parity：两侧原始输出文本一致
+        self.assertEqual(
+            os.path.normcase(ps_home), os.path.normcase(str(py_home)),
+            "短形数据根：PS 与 Python 解析文本不一致",
+        )
+        # 且两侧都已展开到期望长形（不是保持短形）
+        self.assertEqual(os.path.normcase(ps_home), self.expected)
+        self.assertEqual(os.path.normcase(str(py_home)), self.expected)
+
+    def test_long_form_override_parity(self) -> None:
+        """长形覆盖值：两侧一致且保持不变（规范化不引入差异）。"""
+        env = _env(**{DATA_HOME_ENV: str(self.long_dir)})
+        proc = _run_ps(["status"], env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        ps_home = _parse_data_home(proc.stdout)
+        py_home = run_dao_sheng.resolve_data_home(env=env)
+        self.assertEqual(os.path.normcase(ps_home), os.path.normcase(str(py_home)))
+        self.assertEqual(os.path.normcase(str(py_home)), self.expected)
+
+    def test_is_inside_repo_cross_representation(self) -> None:
+        """仓库内拒绝在短名 / 长名混用时仍生效：短形仓库根能拒绝长形
+        仓库内路径，长形仓库根能拒绝短形仓库内路径，反之亦然。"""
+        repo = self.tmp / "RepoLongNameWorktree"
+        (repo / "instances" / "default").mkdir(parents=True)
+        outside = self.tmp / "OutsideLongName"
+        outside.mkdir()
+        short_repo = _short_path(repo)
+        short_instances = _short_path(repo / "instances")
+        short_outside = _short_path(outside)
+        self.assertIsNotNone(short_repo)
+        self.assertIsNotNone(short_instances)
+        self.assertIsNotNone(short_outside)
+        # 长形仓库内路径 vs 短形仓库根 → 拒绝
+        self.assertTrue(
+            run_dao_sheng._is_inside_repo(repo / "instances" / "default",
+                                          Path(short_repo)))
+        # 短形仓库内路径 vs 长形仓库根 → 拒绝
+        self.assertTrue(
+            run_dao_sheng._is_inside_repo(Path(short_instances), repo))
+        # 短形仓库根本身 vs 长形仓库根 → 拒绝（等于仓库根即仓库内）
+        self.assertTrue(
+            run_dao_sheng._is_inside_repo(Path(short_repo), repo))
+        # 短形仓库外路径 vs 长形仓库根 → 不拒绝（安全检查未被扩大）
+        self.assertFalse(
+            run_dao_sheng._is_inside_repo(Path(short_outside), repo))
+
+    def test_resolve_data_home_rejects_short_form_inside_repo(self) -> None:
+        """端到端：短形覆盖值指向仓库内时，Python 侧 fail-loud 拒绝
+        （规范化一致使安全检查跨表示生效）。"""
+        with self.assertRaises(RuntimeError):
+            run_dao_sheng.resolve_data_home(
+                env={DATA_HOME_ENV: self.short_dir}, repo_root=self.tmp,
+            )
+
+    def test_junction_not_resolved(self) -> None:
+        """GetLongPathNameW 不解析 junction：返回链接条目自身的长名，
+        绝不解析到 target——保留「不解析符号链接」的既有设计语义。"""
+        target = self.tmp / "JunctionTargetLongName"
+        target.mkdir()
+        link = self.tmp / "JunctionLinkLongName"
+        mk = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=60,
+        )
+        if mk.returncode != 0:
+            self.skipTest(
+                f"junction creation failed on this machine:\n"
+                f"{mk.stdout}\n{mk.stderr}"
+            )
+        short_link = _short_path(link)
+        if short_link is None:
+            self.skipTest("8.3 short-name generation unavailable")
+        expanded = run_dao_sheng._expand_short_names(short_link)
+        self.assertEqual(os.path.normcase(expanded), os.path.normcase(str(link)))
+        self.assertNotIn("JunctionTargetLongName", os.path.normcase(expanded))
+        # PS 侧同样不解析：data home 报告链接条目自身的长名
+        proc = _run_ps(["status"], env=_env(**{DATA_HOME_ENV: short_link}))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        ps_home = _parse_data_home(proc.stdout)
+        self.assertEqual(os.path.normcase(ps_home), os.path.normcase(str(link)))
+
+    def test_safe83_component_without_tilde(self) -> None:
+        """8.3-valid 长名（无 ~）：其短名就是原名本身（大小写保留），
+        GetLongPathNameW 返回同一文本——移除 ~ 门控后行为不变。只比较
+        末组件：runner 上父组件可能本身是短形（RUNNER~1），那部分会被
+        合法展开。"""
+        safe = self.tmp / "Safe83"
+        safe.mkdir()
+        short = _short_path(safe)
+        if short is None:
+            self.skipTest("8.3 short-name generation unavailable")
+        self.assertEqual(Path(short).name, safe.name)
+        expanded = run_dao_sheng._expand_short_names(str(safe))
+        self.assertEqual(Path(expanded).name, safe.name)
+        self.assertNotIn("~", Path(expanded).name)
+        self.assertEqual(os.path.normcase(expanded), _canonical(str(safe)))
+        # 跨运行时 parity（原始输出文本）
+        env = _env(**{DATA_HOME_ENV: str(safe)})
+        proc = _run_ps(["status"], env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        ps_home = _parse_data_home(proc.stdout)
+        py_home = run_dao_sheng.resolve_data_home(env=env)
+        self.assertEqual(os.path.normcase(ps_home), os.path.normcase(str(py_home)))
+
+
+@unittest.skipIf(os.name != "nt", "GetLongPathNameW 错误码 / 盘符行为专用")
+class LongPathNameErrorTest(unittest.TestCase):
+    """_get_long_path_name 错误码分类（本机实测 Windows 11 26100，
+    2026-10-15）：仅 2（ERROR_FILE_NOT_FOUND，缺失叶子组件）与 3
+    （ERROR_PATH_NOT_FOUND，缺失中间组件 / 不存在盘符的盘符根及其子
+    路径）属于「路径组件不存在」，允许调用方向上回退；不可用 UNC 根实测
+    不落在 2 / 3——不可达主机 53（ERROR_BAD_NETPATH）、可达主机缺失共享
+    67（ERROR_BAD_NAME）、裸服务器名 161（ERROR_BAD_PATH），本就
+    fail-loud。注意 3 也出现在「根本身不可用」形状（不存在盘符），故回
+    退本身不足以判定正常缺失，须由 _expand_short_names 的根终止判定
+    fail-loud；5（ERROR_ACCESS_DENIED
+    ——MSDN：GetLongPathNameW 需要对路径及其各父目录有 List Folder /
+    Read Data / Read Attributes 权限）与 123（ERROR_INVALID_NAME，语法
+    非法形状：非法字符 <>|*?、尾部点/空格、超长组件）及意外错误码一律
+    fail-loud（OSError），绝不静默回退。实测结论：普通不存在路径绝不
+    返回 123，故 123 不得归类为正常缺失。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.long_dir = self.tmp / "LongPathNameErrorLongName"
+        self.long_dir.mkdir()
+        short = _short_path(self.long_dir)
+        self.short_dir = short if short is not None and "~" in Path(short).name else None
+
+    def test_missing_leaf_returns_none(self) -> None:
+        """已存在目录 + 缺失叶子（实测 2）→ None，允许回退。"""
+        self.assertIsNone(
+            run_dao_sheng._get_long_path_name(str(self.long_dir / "MissingLeaf")))
+
+    def test_missing_intermediate_returns_none(self) -> None:
+        """缺失中间组件（实测 3）→ None，允许回退。"""
+        self.assertIsNone(
+            run_dao_sheng._get_long_path_name(
+                str(self.tmp / "MissingInter" / "Deeper")))
+
+    def test_expand_keeps_missing_leaf_verbatim(self) -> None:
+        """回退语义：已存在前缀展开为长名，不存在的叶子逐字保留——
+        待创建目录可正常规范化（短形前缀同样展开到同一长形）。"""
+        expanded = run_dao_sheng._expand_short_names(
+            str(self.long_dir / "MissingLeaf"))
+        self.assertEqual(
+            os.path.normcase(expanded),
+            os.path.normcase(str(self.long_dir / "MissingLeaf")),
+        )
+        if self.short_dir is not None:
+            expanded = run_dao_sheng._expand_short_names(
+                self.short_dir + r"\MissingLeaf")
+            self.assertEqual(
+                os.path.normcase(expanded),
+                os.path.normcase(str(self.long_dir / "MissingLeaf")),
+            )
+
+    def _fail_loud_with_code(self, err: int) -> OSError:
+        """注入 fake GetLongPathNameW（返回 0 + 指定 last error），断言
+        fail-loud 且 winerror 保留。本机无法可靠构造真实 Deny ACE 场景，
+        故以 fake 模拟——错误码语义本身经 MSDN + 本机真实码实测确认。"""
+        original = run_dao_sheng._long_path_name_w
+
+        def fake(path, buffer, size):
+            ctypes.set_last_error(err)
+            return 0
+
+        run_dao_sheng._long_path_name_w = fake
+        try:
+            with self.assertRaises(OSError) as ctx:
+                run_dao_sheng._get_long_path_name(str(self.long_dir))
+            self.assertEqual(ctx.exception.winerror, err)
+            return ctx.exception
+        finally:
+            run_dao_sheng._long_path_name_w = original
+
+    def test_access_denied_fails_loud(self) -> None:
+        """权限拒绝（5）不是「组件不存在」信号：必须 fail-loud，不回退。"""
+        exc = self._fail_loud_with_code(5)
+        self.assertIn("only ERROR_FILE_NOT_FOUND/ERROR_PATH_NOT_FOUND",
+                      str(exc))
+
+    def test_unexpected_error_code_fails_loud(self) -> None:
+        """意外错误码（53 = ERROR_BAD_NETPATH 形状）同样 fail-loud。"""
+        self._fail_loud_with_code(53)
+
+    def test_invalid_name_fails_loud(self) -> None:
+        """真实 API 实测：语法非法形状返回 123——未经核实不得归类为
+        正常缺失，fail-loud。"""
+        with self.assertRaises(OSError) as ctx:
+            run_dao_sheng._get_long_path_name(str(self.long_dir / "bad<>name"))
+        self.assertEqual(ctx.exception.winerror, 123)
+
+    def test_nonexistent_drive_root_fails_loud(self) -> None:
+        """不存在盘符（盘符根与其子路径实测均为 3）：回退到达盘符根而
+        根仍报告缺失 → 不可用根，不是正常缺失组件，_expand_short_names
+        fail-loud（OSError），不再保持输入原样。与 PS 侧
+        test_real_probe_nonexistent_drive_fails_loud 同决策。"""
+        letter = None
+        for candidate in "DEFGHIJKLMNOPQRSTUVWXYZ":
+            if not os.path.exists(candidate + ":\\"):
+                letter = candidate
+                break
+        if letter is None:
+            self.skipTest("no free drive letter on this machine")
+        value = letter + ":\\MissingDrivePath"
+        self.assertIsNone(run_dao_sheng._get_long_path_name(value))
+        self.assertIsNone(run_dao_sheng._get_long_path_name(letter + ":\\"))
+        with self.assertRaises(OSError) as ctx:
+            run_dao_sheng._expand_short_names(value)
+        self.assertIn("could not be verified as existing", str(ctx.exception))
+
+    def test_seam_unc_root_missing_fails_loud(self) -> None:
+        """seam 注入（模拟错误注入，非真实网络集成测试）：UNC 共享根
+        \\server\\share 报告 3（形状模拟）时回退到达共享根仍无法验证 →
+        fail-loud，绝不原样返回。本机没有可用的真实不可达 UNC 服务器，
+        分类逻辑以 fake _long_path_name_w 验证；真实 UNC 错误码分类见
+        test_real_probe_unavailable_unc_share_fails_loud。"""
+        original = run_dao_sheng._long_path_name_w
+
+        def fake(path, buffer, size):
+            ctypes.set_last_error(3)
+            return 0
+
+        run_dao_sheng._long_path_name_w = fake
+        try:
+            with self.assertRaises(OSError) as ctx:
+                run_dao_sheng._expand_short_names(
+                    "\\\\nonexistent-host-dao-probe\\share\\sub")
+            self.assertIn("could not be verified as existing",
+                          str(ctx.exception))
+        finally:
+            run_dao_sheng._long_path_name_w = original
+
+    def test_real_probe_unreachable_unc_fails_loud(self) -> None:
+        """本机 OS 级真实分类（回环主机上必然不存在的共享名，非远程
+        UNC 服务器集成测试）：\\127.0.0.1\<缺失共享> 实测 67
+        （ERROR_BAD_NAME；Afd 服务停止时 53），不属 2 / 3 →
+        _get_long_path_name 与 _expand_short_names 均 fail-loud。"""
+        value = "\\\\127.0.0.1\\dao-sheng-nonexistent-share-probe\\sub"
+        with self.assertRaises(OSError) as ctx:
+            run_dao_sheng._get_long_path_name(value)
+        self.assertNotIn(ctx.exception.winerror,
+                         run_dao_sheng._GLPN_NOT_FOUND_ERRORS)
+        with self.assertRaises(OSError):
+            run_dao_sheng._expand_short_names(value)
+
+
+@unittest.skipIf(os.name != "nt", "盘符根 / 跨盘符判定专用")
+class DriveRootBoundaryTest(unittest.TestCase):
+    """_is_inside_repo 盘符根漏判回归：仓库根为盘符根（normcase 后为
+    「盘符: + 单一尾分隔符」）时，边界必须经 root.rstrip(os.sep) +
+    os.sep 构造为单一分隔符——直接 root + os.sep 产生「盘符: + 双分隔
+    符」，盘符根仓库的直接子路径（C:\\Windows）不以其为前缀 → 漏判。
+    不同盘符的路径盘符字符不同，不可能互为前缀，互不误判。根判定更新
+    后：位于不存在盘符的候选路径或仓库根 fail-loud（OSError），绝不作
+    为「仓库内 / 仓库外」文本误判通过。"""
+
+    def setUp(self) -> None:
+        self.drive = os.environ.get("SystemDrive", "C:").upper()
+        self.root = Path(self.drive + "\\")
+
+    def test_drive_root_itself_is_inside(self) -> None:
+        self.assertTrue(run_dao_sheng._is_inside_repo(self.root, self.root))
+
+    def test_direct_child_of_drive_root(self) -> None:
+        self.assertTrue(
+            run_dao_sheng._is_inside_repo(
+                Path(self.drive + "\\Windows"), self.root))
+
+    def test_deep_child_of_drive_root(self) -> None:
+        self.assertTrue(
+            run_dao_sheng._is_inside_repo(
+                Path(self.drive + "\\Windows\\Temp"), self.root))
+
+    def test_cross_drive_never_flagged(self) -> None:
+        """跨盘符不误判：存在第二已存在盘符时直接验证前缀逻辑（不同盘
+        符不可能互为前缀）。单盘符机器上以不存在盘符验证新的根判定——
+        盘符根无法验证的候选路径 fail-loud 拒绝（绝不被接受为「仓库
+        内」），反向以不可用盘符为仓库根同样 fail-loud。"""
+        existing_other = None
+        for candidate in "DEFGHIJKLMNOPQRSTUVWXYZ":
+            if candidate != self.drive and os.path.exists(candidate + ":\\"):
+                existing_other = candidate
+                break
+        if existing_other is not None:
+            # 其他已存在盘符的路径不得被判为位于本盘符根仓库内
+            self.assertFalse(
+                run_dao_sheng._is_inside_repo(
+                    Path(existing_other + ":\\Windows"), self.root))
+            # 反向：以另一已存在盘符根为仓库根时，本盘符路径同样不误判
+            self.assertFalse(
+                run_dao_sheng._is_inside_repo(
+                    Path(self.drive + "\\Windows"),
+                    Path(existing_other + "\\")))
+            return
+        free = None
+        for candidate in "DEFGHIJKLMNOPQRSTUVWXYZ":
+            if candidate != self.drive and not os.path.exists(candidate + ":\\"):
+                free = candidate
+                break
+        if free is None:
+            self.skipTest("no drive letter available for cross-drive decision")
+        # 不可验证的盘符根：fail-loud 拒绝，不是「仓库内」误判（与
+        # test_nonexistent_drive_root_fails_loud 同决策）。
+        with self.assertRaises(OSError):
+            run_dao_sheng._is_inside_repo(Path(free + ":\\Windows"), self.root)
+        with self.assertRaises(OSError):
+            run_dao_sheng._is_inside_repo(
+                Path(self.drive + "\\Windows"), Path(free + "\\"))
+
+
+@unittest.skipIf(os.name != "nt", "8.3 短名组件 + 不存在叶子分歧专用")
+class ShortPathDivergenceSafetyTest(unittest.TestCase):
+    """已实测分歧形状「已存在 8.3 短名组件 + 不存在叶子」的安全回归。
+
+    PS 5.1 GetFullPath 对该形状的输出文本受同进程调用顺序影响（先调用
+    子路径 → 长形；先对父路径调用 GetFullPath → 短形），文本 parity 不
+    能无条件宣称，本类也不断言显示文本相等。必须保证的是安全判定：两
+    侧运行时对同一形状的「仓库内」决策一致——仓库内被拒（PS exit 1 +
+    [FAIL] data home；Python fail-loud RuntimeError），仓库外被正常接受
+    且不存在叶子逐字保留。dao-sheng.ps1 的 Test-PathInsideRepo 经
+    Get-CanonicalPathForComparison 做与 Python _expand_short_names 相同
+    的 walk-up 规范化（已存在组件一律展开，与调用顺序无关）；修复前
+    raw GetFullPath 文本比较下，短形组件（REPO~1）不以长形仓库根为前缀
+    → 仓库内路径漏判，本类的 PS 拒绝测试即该缺口的回归。
+
+    副本仓库无 .venv：dao-sheng.ps1 的中央守卫先于命令 dispatch 执行，
+    status 对 Python 缺失只报告不 Fail-Step，故拒绝 / 接受判定可在无
+    venv 副本上端到端验证。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.repo_copy = self.tmp / "RepoCopyDivergenceLongName"
+        _copy_repo(self.repo_copy, with_venv=False)
+        short = _short_path(self.repo_copy)
+        if short is None or "~" not in Path(short).name:
+            self.skipTest(
+                "8.3 short-name generation is disabled on this volume "
+                "(or the API failed) -- the divergent shape cannot be "
+                "constructed here; the GitHub Windows runner has it enabled"
+            )
+        self.short_repo = short
+
+    def test_ps_rejects_short_component_with_missing_leaf(self) -> None:
+        value = self.short_repo + r"\instances\MissingLeaf"
+        proc = _run_ps(
+            ["status"], env=_env(**{DATA_HOME_ENV: value}),
+            entry=self.repo_copy / "dao-sheng.ps1",
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("[FAIL] data home", proc.stdout + proc.stderr)
+
+    def test_python_rejects_same_shape(self) -> None:
+        value = self.short_repo + r"\instances\MissingLeaf"
+        with self.assertRaises(RuntimeError):
+            run_dao_sheng.resolve_data_home(
+                env={DATA_HOME_ENV: value}, repo_root=self.repo_copy)
+
+    def test_expand_expands_existing_component_keeps_leaf(self) -> None:
+        """Python walk-up：短形已存在组件恒展开为长形，叶子逐字保留。"""
+        expanded = run_dao_sheng._expand_short_names(
+            self.short_repo + r"\MissingLeaf")
+        self.assertEqual(
+            os.path.normcase(expanded),
+            os.path.normcase(str(self.repo_copy / "MissingLeaf")),
+        )
+
+    def test_is_inside_repo_detects_divergent_shape(self) -> None:
+        self.assertTrue(
+            run_dao_sheng._is_inside_repo(
+                Path(self.short_repo + r"\instances\MissingLeaf"),
+                self.repo_copy))
+
+    def test_outside_missing_leaf_accepted_by_both_runtimes(self) -> None:
+        """仓库外 + 不存在叶子：两侧正常接受（安全检查未被扩大），叶子
+        逐字保留。已存在组件的显示文本可能短 / 长形不一致（PS GetFullPath
+        调用顺序依赖）——不断言文本相等，断言 accept/reject 决策一致。"""
+        outside = self.tmp / "OutsideDivergenceLongName"
+        outside.mkdir()
+        short_outside = _short_path(outside)
+        if short_outside is None or "~" not in Path(short_outside).name:
+            self.skipTest("8.3 short-name generation unavailable")
+        value = short_outside + r"\MissingLeaf"
+        proc = _run_ps(
+            ["status"], env=_env(**{DATA_HOME_ENV: value}),
+            entry=self.repo_copy / "dao-sheng.ps1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        ps_home = _parse_data_home(proc.stdout)
+        self.assertEqual(Path(ps_home).name.lower(), "missingleaf")
+        py_home = run_dao_sheng.resolve_data_home(
+            env={DATA_HOME_ENV: value}, repo_root=self.repo_copy)
+        self.assertEqual(py_home.name, "MissingLeaf")
+        self.assertFalse(
+            run_dao_sheng._is_inside_repo(py_home, self.repo_copy))
+
+
+class PsProbeSeamTest(unittest.TestCase):
+    """dao-sheng.ps1 存在性探针 seam 回归（直接调用生产 helper）。
+
+    两类证据严格区分：
+      - seam 注入（$DaoShengPathExistsProbe scriptblock 模拟错误形状）：
+        验证「确定不存在 → 向上回退、缺失组件逐字保留」与「访问拒绝 /
+        意外错误 / 回退到达根而根仍报告缺失 → 停止」。这是模拟错误注入
+        测试，不是真实 ACL 集成测试。
+      - 真实 Set-Acl Deny ACE（无任何注入，生产探针真实命中被拒路径）：
+        helper 级与中央守卫端到端各一条，是真实 ACL 集成测试。
+    本机实测分类（见 dao-sheng.ps1 注释）：FNFE/DNFE → 确定不存在，允许
+    回退，但回退到达根（盘符根 / UNC 共享根）而根仍报告缺失 → 不可用根
+    → 抛 InvalidOperationException fail-loud，不再逐字保留（与 Python
+    _expand_short_names 根终止判定一致）；访问拒绝 / 意外 IO 错误 / 不可
+    达 UNC（IOException）/ 裸服务器名（ArgumentException）→ 抛错。
+    """
+
+    # 只拒绝读取类权限（保留 WRITE_DAC / DELETE / 子项删除）→ 清理始终能
+    # 移除 ACE 并删除临时目录（同 MigrateDataMidFailureTest._acl 的纪律）。
+    DENY = "ReadData,ReadAttributes,ReadExtendedAttributes,ListDirectory"
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dao-ps-probe-"))
+        # LIFO：先注册 → 后执行（ACL 移除先于临时目录删除）
+        self.addCleanup(shutil.rmtree, str(self.tmp), ignore_errors=True)
+
+    def _acl(self, directory: Path, action: str) -> None:
+        verb = (
+            "$acl.AddAccessRule($rule)" if action == "deny"
+            else "$acl.RemoveAccessRuleAll($rule)"
+        )
+        script = (
+            "$ErrorActionPreference = 'Stop'; "
+            f"$path = '{directory}'; "
+            "$acl = Get-Acl -LiteralPath $path; "
+            "$who = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; "
+            "$rule = New-Object "
+            "System.Security.AccessControl.FileSystemAccessRule("
+            f"$who, '{self.DENY}', "
+            "'ContainerInherit,ObjectInherit', 'None', 'Deny'); "
+            + verb + "; "
+            "Set-Acl -LiteralPath $path -AclObject $acl"
+        )
+        proc = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-Command", script],
+            env=_ps_safe_env(),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ACL {action} failed on {directory}:\n{proc.stdout}\n{proc.stderr}"
+            )
+
+    # ---- seam 注入（模拟错误形状，调用生产 Get-CanonicalPathForComparison）----
+
+    def test_seam_definitively_missing_components_walk_up_verbatim(self) -> None:
+        """注入「仅 tmp 存在」：生产 helper 回退到 tmp 后停止，缺失组件
+        逐字保留（与 Python _expand_short_names 的 walk-up 决策一致）。"""
+        tmp = str(self.tmp)
+        proc = _run_ps_lib(
+            "$DaoShengPathExistsProbe = { param($p) ($p -eq '" + tmp + "') }; "
+            "$r = Get-CanonicalPathForComparison '" + tmp + "\\MissingInter\\MissingLeaf'; "
+            "Write-Host ('RETURNED=' + $r)"
+        )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("RETURNED=" + tmp + "\\MissingInter\\MissingLeaf", out)
+
+    def test_seam_access_denied_mid_path_stops(self) -> None:
+        """注入模拟访问拒绝（中间组件）：helper 必须停止，不得回退、
+        不得返回任何结果。注入的异常不经包装直接传播。"""
+        tmp = str(self.tmp)
+        proc = _run_ps_lib(
+            "$DaoShengPathExistsProbe = { param($p) "
+            "if ($p -eq ('" + tmp + "\\DeniedMid')) { "
+            "throw [System.UnauthorizedAccessException]::new('simulated access denied') } "
+            "return $false }; "
+            "try { $r = Get-CanonicalPathForComparison '" + tmp + "\\DeniedMid\\Leaf'; "
+            "Write-Host ('RETURNED=' + $r) } "
+            "catch { Write-Host ('THREW=' + $_.Exception.GetType().Name) }"
+        )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("THREW=UnauthorizedAccessException", out)
+        self.assertNotIn("RETURNED=", out)
+
+    def test_seam_io_error_at_leaf_stops(self) -> None:
+        """注入模拟意外 IO 错误（叶子）：同样必须停止。"""
+        tmp = str(self.tmp)
+        proc = _run_ps_lib(
+            "$DaoShengPathExistsProbe = { param($p) "
+            "if ($p -eq ('" + tmp + "\\Leaf')) { "
+            "throw [System.IO.IOException]::new('simulated IO error') } "
+            "return $false }; "
+            "try { $r = Get-CanonicalPathForComparison '" + tmp + "\\Leaf'; "
+            "Write-Host ('RETURNED=' + $r) } "
+            "catch { Write-Host ('THREW=' + $_.Exception.GetType().Name) }"
+        )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("THREW=IOException", out)
+        self.assertNotIn("RETURNED=", out)
+
+    def test_seam_drive_root_error_stops(self) -> None:
+        """注入模拟「驱动器根不可用」错误：walk-up 到达驱动器根时探针抛错
+        → 停止；绝不得静默返回原样文本。"""
+        proc = _run_ps_lib(
+            "$DaoShengPathExistsProbe = { param($p) "
+            "if ($p -eq 'Z:\\') { "
+            "throw [System.IO.IOException]::new('simulated unavailable drive') } "
+            "return $false }; "
+            "try { $r = Get-CanonicalPathForComparison 'Z:\\MissingDrivePath'; "
+            "Write-Host ('RETURNED=' + $r) } "
+            "catch { Write-Host ('THREW=' + $_.Exception.GetType().Name) }"
+        )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("THREW=IOException", out)
+        self.assertNotIn("RETURNED=", out)
+
+    # ---- 无注入：生产探针对本机真实路径的分类 ----
+
+    def test_real_probe_classifies_existing_and_definitively_missing(self) -> None:
+        """生产 Test-PathExistsForComparison：已存在 → True；缺失叶子 /
+        缺失中间组件 → False（FNFE/DNFE，确定不存在）。"""
+        existing = self.tmp / "ExistingDir"
+        existing.mkdir()
+        proc = _run_ps_lib(
+            "Write-Host ('existing=' + (Test-PathExistsForComparison '"
+            + str(existing) + "')); "
+            "Write-Host ('missingleaf=' + (Test-PathExistsForComparison '"
+            + str(existing) + "\\MissingLeaf')); "
+            "Write-Host ('missinginter=' + (Test-PathExistsForComparison '"
+            + str(self.tmp) + "\\MissingInter\\Deeper'))"
+        )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("existing=True", out)
+        self.assertIn("missingleaf=False", out)
+        self.assertIn("missinginter=False", out)
+
+    def test_real_probe_nonexistent_drive_fails_loud(self) -> None:
+        """无注入：本机不存在的盘符由 OS 报告为 DNFE（确定不存在）→
+        walk-up 到达盘符根而根仍报告缺失 → 不可用根 → 抛
+        InvalidOperationException fail-loud，不再逐字保留原样文本（与
+        Python LongPathNameErrorTest.test_nonexistent_drive_root_fails_loud
+        同决策）。"""
+        free = None
+        for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+            if not os.path.exists(letter + ":\\"):
+                free = letter
+                break
+        if free is None:
+            self.skipTest("no free drive letter on this machine")
+        value = free + ":\\MissingDrivePath"
+        proc = _run_ps_lib(
+            "try { $r = Get-CanonicalPathForComparison '" + value + "'; "
+            "Write-Host ('RETURNED=' + $r) } "
+            "catch { Write-Host ('THREW=' + $_.Exception.GetType().Name); "
+            "Write-Host ('MSG=' + $_.Exception.Message) }"
+        )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("THREW=InvalidOperationException", out)
+        self.assertIn("could not be verified as existing", out)
+        self.assertNotIn("RETURNED=", out)
+
+    def test_seam_root_always_missing_fails_loud(self) -> None:
+        """seam 注入（模拟错误注入，非真实网络集成测试）：探针对所有路径
+        返回 $false（模拟整条路径含根都报告缺失，如不存在盘符或不可用
+        UNC 共享根的形状）→ walk-up 到达根后必须抛
+        InvalidOperationException，绝不返回原样文本。"""
+        proc = _run_ps_lib(
+            "$DaoShengPathExistsProbe = { param($p) return $false }; "
+            "try { $r = Get-CanonicalPathForComparison 'Z:\\MissingDrivePath'; "
+            "Write-Host ('RETURNED=' + $r) } "
+            "catch { Write-Host ('THREW=' + $_.Exception.GetType().Name); "
+            "Write-Host ('MSG=' + $_.Exception.Message) }"
+        )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("THREW=InvalidOperationException", out)
+        self.assertIn("could not be verified as existing", out)
+        self.assertNotIn("RETURNED=", out)
+
+    def test_real_probe_unavailable_unc_share_fails_loud(self) -> None:
+        """本机 OS 级真实分类（回环主机上必然不存在的共享名，非远程 UNC
+        服务器集成测试；本机没有可用的真实不可达 UNC 服务器）：生产探针
+        对 \\127.0.0.1\<缺失共享> 真实命中 IOException（不可用共享，不是
+        DNFE）→ Get-CanonicalPathForComparison 抛
+        InvalidOperationException，不得返回原样文本。"""
+        value = '\\\\127.0.0.1\\dao-sheng-nonexistent-share-probe\\sub'
+        proc = _run_ps_lib(
+            "try { $r = Get-CanonicalPathForComparison '" + value + "'; "
+            "Write-Host ('RETURNED=' + $r) } "
+            "catch { Write-Host ('THREW=' + $_.Exception.GetType().Name); "
+            "Write-Host ('MSG=' + $_.Exception.Message) }"
+        )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("THREW=InvalidOperationException", out)
+        self.assertIn("existence probe failed", out)
+        self.assertNotIn("RETURNED=", out)
+
+    # ---- 真实 ACL 集成测试（无注入，Set-Acl Deny ACE）----
+
+    def test_real_acl_denied_intermediate_fails_loud(self) -> None:
+        """真实 ACL 集成测试（helper 级）：DeniedDir 上 Set-Acl Deny
+        （ListDirectory/ReadAttributes，ContainerInherit）→ 生产探针对
+        DeniedDir\\ChildDir\\Leaf 真实命中访问拒绝 → 抛
+        InvalidOperationException（消息明确「未被当成不存在」），
+        walk-up 不得越过被拒组件。"""
+        denied = self.tmp / "DeniedDir"
+        child = denied / "ChildDir"
+        child.mkdir(parents=True)
+        self._acl(denied, "deny")
+        self.addCleanup(self._acl, denied, "remove")
+        proc = _run_ps_lib(
+            "try { $r = Get-CanonicalPathForComparison '" + str(child) + "\\Leaf'; "
+            "Write-Host ('RETURNED=' + $r) } "
+            "catch { Write-Host ('THREW=' + $_.Exception.GetType().Name); "
+            "Write-Host ('MSG=' + $_.Exception.Message) }"
+        )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("THREW=InvalidOperationException", out)
+        self.assertIn("existence probe failed", out)
+        self.assertIn("not 'missing' and was not treated as such", out)
+        self.assertNotIn("RETURNED=", out)
+
+    def test_real_acl_end_to_end_guard_fails_loud(self) -> None:
+        """真实 ACL 集成测试（端到端）：数据根真实存在但位于被 Deny ACE
+        拒绝读取的目录下 → 中央守卫分类探针真实命中访问拒绝 → exit 1 +
+        [FAIL] data home + existence probe failed；既不被当成「缺失」也不
+        被当成「仓库内 / 仓库外」判定成功，任何写入都未发生。"""
+        denied = self.tmp / "DeniedHome"
+        data_home = denied / "DataHome"
+        data_home.mkdir(parents=True)
+        self._acl(denied, "deny")
+        self.addCleanup(self._acl, denied, "remove")
+        proc = _run_ps(
+            ["status"], env=_env(**{DATA_HOME_ENV: str(data_home)}),
+        )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn("[FAIL] data home", out)
+        self.assertIn("existence probe failed", out)
+        self.assertIn("nothing was written", out)
+        # 被拒根目录仍在（其 stat 经未拒绝的父目录条目可查）。DataHome 本身
+        # 的 stat 恰被 Deny ACE 阻断——那正是探针命中并 fail-loud 的形状，
+        # 无法也不应在此读取验证；守卫在 dispatch 之前失败，未发生任何写入。
+        self.assertTrue(denied.is_dir())
 
 
 if __name__ == "__main__":

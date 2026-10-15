@@ -51,10 +51,12 @@ M09 S4；宿主侧幂等 = 导入日志 append-only）。配置来源 =
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import sys
 from collections.abc import Mapping
+from ctypes import wintypes
 from pathlib import Path
 
 from dao_sheng.composition import (
@@ -93,19 +95,176 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 
+_long_path_name_w = None  # 显式声明 argtypes / restype 后的 GetLongPathNameW 缓存
+
+# 经本机实测（Windows 11 26100，2026-10-15）确认属于「路径组件不存在」、
+# 允许调用方向上回退到最长存在前缀的错误码：
+# 2 = ERROR_FILE_NOT_FOUND（缺失叶子组件；保留名 CON/NULL 亦返回 2）；
+# 3 = ERROR_PATH_NOT_FOUND（缺失中间组件 / 不存在盘符的盘符根及其子路径）。
+# 不可用 UNC 根实测不落在 2 / 3：不可达主机（\\nonexistent-host\share 及
+# 其子路径）返回 53（ERROR_BAD_NETPATH）；可达主机上不存在的共享
+# （\\127.0.0.1\share 及其子路径）返回 67（ERROR_BAD_NAME）；裸服务器名
+# （\\server）返回 161（ERROR_BAD_PATH）——一律 fail-loud，绝不回退。
+# 实测结论：普通不存在路径（缺失叶子或中间组件、不存在盘符）一律返回
+# 2 或 3，绝不返回 123；123 = ERROR_INVALID_NAME 只出现在语法非法形状
+# （非法字符 <>|*?、尾部点/空格、超长组件）。MSDN 另确认：GetLongPathNameW
+# 需要对路径及其各父目录有 List Folder / Read Data / Read Attributes 权限，
+# 无法查询时会返回 5（ERROR_ACCESS_DENIED）——这不是「组件不存在」的信号，
+# 不得回退。注意：3 也出现在「根本身不可用」的形状（不存在盘符的盘符根
+# 实测 3）——回退不得因此把根不可用当成正常缺失，见 _expand_short_names
+# 的根终止判定。
+_GLPN_NOT_FOUND_ERRORS = frozenset({2, 3})
+
+
+def _get_long_path_name(path: str) -> str | None:
+    """GetLongPathNameW 包装：把「已存在」路径中 8.3 短名组件展开为其
+    磁盘长名。仅当 last error 经实测确认属于「路径组件不存在」
+    （ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND，实测 2 / 3）时返回
+    None——调用方 _expand_short_names 向上回退到最长存在前缀，不存在
+    的组件逐字保留（不存在的组件不可能有短名，绝不凭空编造展开）。
+    其余失败（ERROR_ACCESS_DENIED=5、ERROR_INVALID_NAME=123、意外码）
+    一律抛出 OSError（winerror 携带错误码）——fail-loud，绝不静默吞掉。
+
+    必须用 WinDLL("kernel32", use_last_error=True) 并在每次调用前
+    set_last_error(0)：ctypes.windll 不能可靠捕获本次调用的 last error
+    （其间其他 ctypes 调用可能覆盖它），返回 0 后必须立即
+    get_last_error() 读取。
+
+    ctypes argtypes / restype 显式声明（LPCWSTR / LPWSTR / DWORD）：
+    ctypes 默认返回类型是 c_int，会把返回值（长度 / 所需缓冲区大小）
+    误读为负数或截断，必须声明为 DWORD。MSDN 返回值语义：
+    - 成功 → 长名长度（不含 NUL）→ 0 < written < size，取 buffer.value；
+    - 缓冲区不足 → 所需缓冲区长度（含 NUL）→ 按该长度重试（必然终止：
+      重试后 written = 所需长度 - 1 < size）；
+    - 失败 → 0：立即读 GetLastError 分类。2 / 3 → 返回 None（普通不存在
+      路径与待创建数据目录实测只会命中这两个码 → 待创建场景始终可正常
+      规范化，不会被 fail-loud 阻断）；5 / 123 / 其他 → 抛 OSError。
+
+    已实测评估（tests.test_data_home ShortPathParityTest）：不解析
+    junction / 符号链接——返回链接条目自身的长名，保留「不解析符号
+    链接」的既有设计语义。"""
+    global _long_path_name_w
+    if _long_path_name_w is None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetLongPathNameW.argtypes = [
+            wintypes.LPCWSTR,  # lpszPath
+            wintypes.LPWSTR,   # lpBuffer（create_unicode_buffer 实例）
+            wintypes.DWORD,    # cchBuffer
+        ]
+        kernel32.GetLongPathNameW.restype = wintypes.DWORD
+        _long_path_name_w = kernel32.GetLongPathNameW
+    get_long_path_name = _long_path_name_w
+    size = max(260, len(path) + 1)
+    while True:
+        buffer = ctypes.create_unicode_buffer(size)
+        ctypes.set_last_error(0)
+        written = get_long_path_name(path, buffer, size)
+        if 0 < written < size:
+            return buffer.value
+        if written == 0:
+            err = ctypes.get_last_error()
+            if err in _GLPN_NOT_FOUND_ERRORS:
+                return None  # 组件不存在（实测 2 / 3）：调用方向上回退
+            # CPython OSError 构造为位置参数（errno, strerror, filename,
+            # winerror）——keyword 形式会 TypeError。errno 传 None（未知
+            # 语义 errno，刻意不伪装），winerror 保留原始 GetLastError。
+            raise OSError(
+                None,
+                f"GetLongPathNameW failed on {path!r}: GetLastError={err} "
+                "(only ERROR_FILE_NOT_FOUND/ERROR_PATH_NOT_FOUND are treated "
+                "as missing components)",
+                path,
+                err,
+            )
+        size = written + 1  # 缓冲区不足：MSDN 返回所需长度（含 NUL），按它重试
+
+
+def _expand_short_names(path: str) -> str:
+    """把 Windows 8.3 短名表示规范化为长名（非 Windows 下为 no-op）。
+
+    与 dao-sheng.ps1 中 [System.IO.Path]::GetFullPath 的既有行为对齐：
+    已存在的组件一律经 GetLongPathNameW 展开为磁盘长名（向上回退到最
+    长存在前缀，再把不存在的剩余组件逐字追加——不存在的组件不可能有
+    短名）。GitHub Windows runner 的 TEMP 为 C:\\Users\\RUNNER~1\\...，
+    PowerShell 报告 C:\\Users\\runneradmin\\...——对完全存在的路径两侧
+    产出同一文本（已实测：ShortPathParityTest）。但对「已存在 8.3 短名
+    组件 + 不存在叶子」形状，PS 5.1 GetFullPath 的输出受同进程内调用
+    顺序影响（本机实测：先调用子路径 → 长形；先对父路径调用 GetFullPath
+    再调用子路径 → 短形），该形状的文本 parity 不能无条件宣称；Python
+    侧 walk-up 恒展开已存在组件，dao-sheng.ps1 的 Test-PathInsideRepo
+    经 Get-CanonicalPathForComparison 采用同样的 walk-up 规范化，保证
+    两侧「仓库内」判定对该形状安全一致（tests.test_data_home
+    ShortPathDivergenceSafetyTest）。不解析 junction / 符号链接（见
+    _get_long_path_name）。
+
+    回退只对探针判定为「确定不存在」（实测错误码 2 / 3）的组件进行。若
+    回退到达根（盘符根或 UNC 共享根）而根探针仍报告缺失，说明该根不可
+    用——不存在的盘符根，或不可达 / 不存在的 UNC 共享根——这不是「正常
+    缺失组件」，必须 fail-loud 抛出 OSError，绝不原样返回输入（与
+    dao-sheng.ps1 Get-CanonicalPathForComparison 的根终止判定一致）。
+    位于已存在盘符上的正常新建数据目录（缺失叶子 / 中间组件）回退必然
+    终止于已验证存在的组件（至少是盘符根本身），不受该规则影响。
+
+    不以「路径文本是否包含 ~」作为判断条件：Windows API 文档明确短文件
+    名不一定包含 ~（8.3 合法的长名，其短名就是原名本身，大小写保留），
+    因此对 nt 上的路径无条件调用 GetLongPathNameW，由 API 本身决定是否
+    需要展开。文本无 ~ 的已存在路径 API 返回同一文本（已实测评估：
+    tests.test_data_home ShortPathParityTest
+    test_safe83_component_without_tilde），无正确性损失。"""
+    if os.name != "nt":
+        return path
+    remainder: list[str] = []
+    current = path
+    while True:
+        expanded = _get_long_path_name(current)
+        if expanded is not None:
+            break
+        head, tail = os.path.split(current)
+        if not tail or head == current:
+            # 回退已到达根（盘符根 / UNC 共享根）且根探针报告缺失：不可用
+            # 的盘符根或不可达 / 不存在的 UNC 共享根不是正常缺失组件，
+            # fail-loud，绝不原样返回输入。
+            raise OSError(
+                None,
+                f"root of {path!r} ({current!r}) could not be verified as "
+                "existing: unavailable drive root or missing / unreachable "
+                "UNC share root is not a normal missing component",
+                path,
+            )
+        remainder.append(tail)
+        current = head
+    for tail in reversed(remainder):
+        expanded = os.path.join(expanded, tail)
+    return expanded
+
+
 def _normalize_path(path: Path) -> Path:
     """前导 ~ 展开 + 相对路径按当前工作目录解析 + 规范化绝对路径
-    （不解析符号链接，与 PowerShell GetFullPath 行为对齐）。"""
-    return Path(os.path.abspath(os.path.expanduser(str(path))))
+    （不解析符号链接，与 PowerShell GetFullPath 行为对齐；Windows 下
+    已存在组件的 8.3 短名展开为长名，同样与 GetFullPath 的展开行为
+    对齐——见 _expand_short_names）。"""
+    return Path(_expand_short_names(os.path.abspath(os.path.expanduser(str(path)))))
 
 
 def _is_inside_repo(path: Path, repo_root: Path) -> bool:
     """路径是否位于 Git worktree（仓库根）内：规范化后做分隔符边界
     比较（等于仓库根，或以「仓库根 + 分隔符」为前缀）；Windows 下
-    大小写不敏感（normcase），POSIX 下大小写敏感。"""
-    resolved = os.path.normcase(os.path.abspath(str(path)))
-    root = os.path.normcase(os.path.abspath(str(repo_root)))
-    return resolved == root or resolved.startswith(root + os.sep)
+    大小写不敏感（normcase），POSIX 下大小写敏感。两侧均经
+    _normalize_path——同一实际位置的短名 / 长名表示判定一致（短形仓库
+    根同样能拒绝长形仓库内数据根，反之亦然）。
+
+    边界构造为 root.rstrip(os.sep) + os.sep：仓库根为盘符根时
+    （normcase 后为「盘符: + 单一尾分隔符」），直接 root + os.sep 产生
+    「盘符: + 双分隔符」，盘符根的直接子路径不以其为前缀 → 盘符根
+    仓库的仓库内判定漏判；rstrip 再补一个分隔符保证单一分隔符边界
+    （POSIX 根 "/" 同理："/".rstrip("/") + "/" == "/"）。不同盘符的
+    路径盘符字符不同，不可能互为前缀，不会误判。不解析符号链接 /
+    junction（与 _normalize_path 语义一致，见 test_junction_not_resolved）。"""
+    resolved = os.path.normcase(str(_normalize_path(path)))
+    root = os.path.normcase(str(_normalize_path(repo_root)))
+    if resolved == root:
+        return True
+    return resolved.startswith(root.rstrip(os.sep) + os.sep)
 
 
 def resolve_data_home(
@@ -344,7 +503,9 @@ def run_host_sync(assembly: RuntimeAssembly) -> int:
 def main(argv: list[str]) -> int:
     try:
         data_home = resolve_data_home()
-    except RuntimeError as e:
+    except (OSError, RuntimeError) as e:
+        # OSError：_get_long_path_name 对权限拒绝 / 意外错误码 fail-loud
+        # （见其 docstring）——同样按配置非法诊断，绝不静默继续。
         print(f"数据根配置非法：{e}", file=sys.stderr)
         return 2
     try:
